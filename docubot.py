@@ -9,6 +9,19 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Common words that match almost every document and add only noise to scoring
+STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "do", "does", "for",
+    "from", "how", "i", "in", "is", "it", "of", "on", "or", "that", "the",
+    "docs", "there", "these", "this", "to", "what", "when", "where", "which", "with",
+}
+
+# Refusal guardrail: a snippet counts as evidence only if it contains at least
+# this many distinct query words (or all of them, for very short queries)
+MIN_MATCHED_WORDS = 2
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +35,12 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
+        # Split documents into heading sections and index those, so retrieval
+        # returns small snippets instead of whole files
+        self.chunks = self.split_into_chunks(self.documents)  # List of (filename, section)
+
         # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -48,23 +65,65 @@ class DocuBot:
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    @staticmethod
+    def split_into_chunks(documents):
+        """
+        Splits each (filename, text) document into heading sections.
+        A section is a markdown heading line plus the lines under it, up to the
+        next heading. Text before the first heading is its own section.
+        Lines inside ``` fences are never treated as headings.
+        Returns a list of (filename, section_text).
+        """
+        chunks = []
+        for filename, text in documents:
+            current = []
+            in_fence = False
+            for line in text.splitlines():
+                if line.lstrip().startswith("```"):
+                    in_fence = not in_fence
+                if not in_fence and line.startswith("#") and current:
+                    chunks.append((filename, "\n".join(current).strip()))
+                    current = []
+                current.append(line)
+            chunks.append((filename, "\n".join(current).strip()))
+        return [(f, c) for f, c in chunks if c]
+
+    @staticmethod
+    def _stem(word):
+        """Crude suffix stripping so 'connect' matches 'connection', 'users' matches 'user'."""
+        for suffix in ("ion", "ing", "ed", "s"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+                return word[: -len(suffix)]
+        return word
+
+    @classmethod
+    def _tokenize(cls, text):
+        """Lowercase, split into alphanumeric words, drop stopwords, stem the rest."""
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        return [cls._stem(w) for w in words if w not in STOPWORDS]
+
+    def build_index(self, chunks):
         """
         TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to the chunks
+        they appear in. Each chunk is a (filename, section_text) pair and is
+        identified by its position in the chunks list.
 
         Example structure:
         {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
+            "token": [0, 3],
+            "database": [12]
         }
 
         Keep this simple: split on whitespace, lowercase tokens,
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for chunk_id, (_, text) in enumerate(chunks):
+            for token in self._tokenize(text):
+                ids = index.setdefault(token, [])
+                if chunk_id not in ids:
+                    ids.append(chunk_id)
         return index
 
     # -----------------------------------------------------------
@@ -81,18 +140,38 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        text_tokens = set(self._tokenize(text))
+        return sum(1 for word in set(self._tokenize(query)) if word in text_tokens)
 
     def retrieve(self, query, top_k=3):
         """
         TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Use the index and scoring function to select top_k relevant document snippets
+        (heading sections, not whole files).
 
         Return a list of (filename, text) sorted by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
+        # Only chunks sharing at least one word with the query are candidates
+        candidates = set()
+        for word in self._tokenize(query):
+            candidates.update(self.index.get(word, []))
+
+        scored = []
+        for chunk_id in candidates:
+            filename, text = self.chunks[chunk_id]
+            score = self.score_document(query, text)
+            if score > 0:
+                scored.append((score, filename, chunk_id))
+
+        # Guardrail: with too little overlap the snippets are coincidence, not
+        # evidence, so return nothing and let the answer modes say "I do not know"
+        query_words = set(self._tokenize(query))
+        min_score = min(MIN_MATCHED_WORDS, len(query_words))
+        scored = [item for item in scored if item[0] >= min_score]
+
+        # Highest score first; filename then position break ties deterministically
+        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+        results = [self.chunks[chunk_id] for _, _, chunk_id in scored]
         return results[:top_k]
 
     # -----------------------------------------------------------
